@@ -1,0 +1,533 @@
+'use client';
+import { useEffect, useRef, useState } from 'react';
+import { ChevronDown, WifiOff } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
+import { Button } from '@/components/ui/button';
+import { Card, CardBody } from '@/components/ui/card';
+import { EmptyState } from '@/components/ui/empty-state';
+import { Notice } from '@/components/ui/notice';
+import { Progress } from '@/components/ui/progress';
+import { PageContainer, Section } from '@/components/ui/section';
+import { icons, type IconComponent } from '@/components/ui/icons';
+import { sharedFirebaseConfigured } from '@/lib/firebase';
+import { CONSENT_KEY, LEGAL } from '@/lib/legal';
+import previewFixtures from './preview/fixtures.json';
+import PlanView from './PlanView';
+import Pledges from './features/Pledges';
+import SettleUp from './features/SettleUp';
+import ShareCards from './features/ShareCards';
+import SilentPrefs from './features/SilentPrefs';
+import Tasks from './features/Tasks';
+import { DestinationPicker, PlanMoney, UpiPanel } from './FermatExtras';
+import { CreateRoomCard, JoinRoomCard, OrganizerIdentityCard, SignInCard, type RoomDraft } from './shell/EntryCards';
+import { InvitePanel, PendingApproval } from './shell/InvitePanel';
+import { PlannerFooter, TopBar, TripHeader, TripSummary, stepEyebrow } from './shell/PlannerChrome';
+import { PrivateDetailsForm, PrivateDetailsSummary, type PrivateInput } from './shell/PrivateDetailsForm';
+import {
+  DEFAULT_HOME_COUNTRY,
+  approvedCount,
+  currencyForCountry,
+  currentStep,
+  defaultBudget,
+  defaultDepartureCity,
+  detectHomeCountry,
+  inviteMessage,
+  inviteUrl,
+  openWhatsApp,
+  planSummary,
+  type StepId,
+} from './shell/tripState';
+
+/** Starting values for the private form, from the trip's settings. India trips start exactly as before (Delhi, ₹1,50,000). */
+function startingInput(trip: any): PrivateInput {
+  const home = trip?.homeCountry || DEFAULT_HOME_COUNTRY;
+  return {
+    departureCity: defaultDepartureCity(home),
+    budget: defaultBudget(trip?.currency || 'INR'),
+    passportExpiry: trip?.scope === 'domestic' ? 'none' : '',
+    visas: [],
+    datesConfirmed: false,
+    preferences: [],
+    entryCheckAcknowledged: false,
+    isAdult: false,
+    passportCountry: home,
+  };
+}
+
+/** Saved details into form values. Old saves only have hasIndianPassport, which means an Indian passport. */
+const fromSaved = (saved: any, trip: any): PrivateInput => ({
+  ...saved,
+  passportCountry: saved.passportCountry || (saved.hasIndianPassport ? 'IN' : trip?.homeCountry || DEFAULT_HOME_COUNTRY),
+});
+
+/** What the engine stores: passportCountry always; hasIndianPassport only for Indian passports, for older readers. */
+function constraintsPayload(input: PrivateInput) {
+  const { hasIndianPassport: _legacy, ...rest } = input;
+  return input.passportCountry === 'IN' ? { ...rest, hasIndianPassport: true } : rest;
+}
+
+const scrollToStep = (id: StepId) => document.getElementById(`step-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+function Point({ icon: Icon, title, children }: { icon: IconComponent; title: string; children: React.ReactNode }) {
+  return (
+    <li className="flex gap-3">
+      <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand-700">
+        <Icon className="size-5" strokeWidth={1.75} aria-hidden />
+      </span>
+      <span className="min-w-0 pt-0.5">
+        <span className="type-body block font-semibold text-ink">{title}</span>
+        <span className="type-small block text-ink-muted">{children}</span>
+      </span>
+    </li>
+  );
+}
+
+function EntryHero() {
+  return (
+    <div className="grid gap-6 lg:pt-6">
+      <div className="grid gap-3">
+        <p className="type-overline m-0 text-brand-600">Group trips, sorted</p>
+        <h1 className="type-display m-0 text-balance">Find a trip your whole group can actually take</h1>
+        <p className="type-lead m-0 max-w-prose text-ink-soft">
+          Everyone adds their budget and passport privately. Fermat shows what works for the group and turns the vote into a day-by-day plan.
+        </p>
+      </div>
+      <ul className="m-0 hidden list-none gap-5 p-0 sm:grid">
+        <Point icon={icons.private} title="Budgets stay private">
+          The group sees &ldquo;2 budgets short&rdquo;, never whose.
+        </Point>
+        <Point icon={icons.vote} title="Vote in secret">
+          Only places everyone can go are able to win.
+        </Point>
+        <Point icon={icons.plan} title="Get a real plan">
+          Days, cost per person and who&rsquo;s doing what.
+        </Point>
+      </ul>
+    </div>
+  );
+}
+
+export default function CollaborativeTripPlanner() {
+  const auth = useAuth();
+  // UI preview mode (/plan?preview=signin|create|collecting|ready|voting|voted|locked|lockedMember): engine-generated sample trips, no network.
+  const [preview, setPreview] = useState<string | null>(null);
+  useEffect(() => {
+    setPreview(new URLSearchParams(location.search).get('preview'));
+  }, []);
+  const previewUid = (preview && (previewFixtures as any).memberUids?.[preview]) || (preview === 'lockedMember' ? previewFixtures.memberUid : 'owner');
+  const previewUser: any = preview && preview !== 'signin' ? { uid: previewUid, isAnonymous: false, getIdToken: async () => '' } : null;
+  const user: any = preview ? previewUser : auth.user;
+  const loading = preview ? false : auth.loading;
+  const [consented, setConsented] = useState(false);
+  useEffect(() => {
+    setConsented(localStorage.getItem(CONSENT_KEY) === LEGAL.version);
+  }, []);
+  const updateConsent = (value: boolean) => {
+    setConsented(value);
+    if (value) localStorage.setItem(CONSENT_KEY, LEGAL.version);
+    else localStorage.removeItem(CONSENT_KEY);
+  };
+  const [trip, setTrip] = useState<any>();
+  const [invite, setInvite] = useState('');
+  const [token, setToken] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [pendingCommand, setPendingCommand] = useState('');
+  const [nickname, setNickname] = useState('');
+  const [online, setOnline] = useState(true);
+  const [inviteReady, setInviteReady] = useState(false);
+  const [privateInputDirty, setPrivateInputDirty] = useState(false);
+  const [createKey] = useState(() => `create-${globalThis.crypto?.randomUUID?.() || Date.now()}`);
+  const [draft, setDraft] = useState<RoomDraft>({
+    name: 'Friends escape',
+    startDate: '2026-12-10',
+    endDate: '2026-12-15',
+    expectedSize: 4,
+    homeCountry: DEFAULT_HOME_COUNTRY,
+    currency: 'INR',
+    scope: 'any',
+  });
+  // Guess where the group is based from the browser language (en-US -> US). Runs once, before anyone edits the form.
+  useEffect(() => {
+    const detected = detectHomeCountry();
+    if (detected && detected !== DEFAULT_HOME_COUNTRY) setDraft((current) => ({ ...current, homeCountry: detected, currency: currencyForCountry(detected) || current.currency }));
+  }, []);
+  const [privateInput, setPrivateInput] = useState<PrivateInput>(() => startingInput(null));
+  const updatePrivateInput = (patch: Partial<PrivateInput>) => {
+    setPrivateInputDirty(true);
+    setPrivateInput((current) => ({ ...current, ...patch }));
+  };
+  const togglePrivateList = (key: 'visas' | 'preferences', value: string) => {
+    setPrivateInputDirty(true);
+    setPrivateInput((current) => ({ ...current, [key]: current[key].includes(value) ? current[key].filter((item) => item !== value) : [...current[key], value] }));
+  };
+  useEffect(() => {
+    const found = location.hash.match(/invite=([^&]+)/)?.[1];
+    if (found) {
+      setTrip(undefined);
+      setToken(decodeURIComponent(found));
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+    setInviteReady(true);
+  }, []);
+  useEffect(() => {
+    const update = () => setOnline(navigator.onLine);
+    update();
+    addEventListener('online', update);
+    addEventListener('offline', update);
+    return () => {
+      removeEventListener('online', update);
+      removeEventListener('offline', update);
+    };
+  }, []);
+  async function readTrip(tripId: string, quiet = false) {
+    if (!user || preview) return;
+    try {
+      const auth = await user.getIdToken();
+      const response = await fetch(`/api/group-trips?tripId=${encodeURIComponent(tripId)}`, { headers: { authorization: `Bearer ${auth}` } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      setTrip(data.trip);
+    } catch (cause: any) {
+      if (!quiet) setError(cause.message || 'Could not refresh the trip');
+    }
+  }
+  useEffect(() => {
+    if (!user || !inviteReady || token) return;
+    const stored = localStorage.getItem(`fermat.shared-trip.${user.uid}`);
+    if (stored) readTrip(stored);
+  }, [user, inviteReady, token]);
+  useEffect(() => {
+    if (!user || !trip?.id) return;
+    localStorage.setItem(`fermat.shared-trip.${user.uid}`, trip.id);
+    const timer = setInterval(() => readTrip(trip.id, true), 3000);
+    return () => clearInterval(timer);
+  }, [user, trip?.id]);
+  // Copy saved details into the form only when the saved value actually changes, never on every 3s poll,
+  // so a half-picked passport month/year (or any edit) is never overwritten while you're filling it in.
+  const syncedConstraints = useRef('');
+  useEffect(() => {
+    const saved = trip?.myConstraints;
+    if (!saved || privateInputDirty) return;
+    const key = JSON.stringify(saved);
+    if (key === syncedConstraints.current) return;
+    syncedConstraints.current = key;
+    setPrivateInput(fromSaved(saved, trip));
+  }, [trip?.myConstraints, privateInputDirty]);
+  // No saved details yet: start the form from this trip's country, currency and scope.
+  const startedFor = useRef('');
+  useEffect(() => {
+    if (!trip?.id || trip.myConstraints || privateInputDirty) return;
+    const key = `${trip.id}|${trip.homeCountry}|${trip.currency}|${trip.scope}`;
+    if (key === startedFor.current) return;
+    startedFor.current = key;
+    setPrivateInput(startingInput(trip));
+  }, [trip?.id, trip?.homeCountry, trip?.currency, trip?.scope, trip?.myConstraints, privateInputDirty]);
+  async function request(body: any) {
+    if (preview) return true;
+    if (!user) return false;
+    setBusy(true);
+    setPendingCommand(body.command?.type || body.action || '');
+    setError('');
+    try {
+      if (!navigator.onLine) throw new Error('You are offline. Your unsent form is still here.');
+      const auth = await user.getIdToken();
+      const response = await fetch('/api/group-trips', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      setTrip(data.trip);
+      if (data.invite) setInvite(data.invite);
+      if (body.command?.type === 'revokeInvite') setInvite('');
+      return true;
+    } catch (cause: any) {
+      setError(cause.message || 'Command failed');
+      return false;
+    } finally {
+      setBusy(false);
+      setPendingCommand('');
+    }
+  }
+  const command = (command: any) => request({ action: 'command', tripId: trip.id, command });
+  const me = user && trip?.members?.[user.uid];
+  const owner = me?.role === 'owner';
+  const disabled = busy || !online;
+  const featureProps = { trip, uid: user?.uid || '', owner, disabled, command };
+  useEffect(() => {
+    const sample = preview && (previewFixtures as any)[preview];
+    if (sample && typeof sample === 'object') setTrip(sample);
+  }, [preview]);
+
+  // Commands (payloads unchanged).
+  const saveDetails = async () => {
+    if (await command({ type: 'submitConstraints', expectedInputRevision: trip.inputRevision, constraints: constraintsPayload(privateInput) })) setPrivateInputDirty(false);
+  };
+  const openVoting = () => command({ type: 'openVoting', expectedInputRevision: trip.inputRevision });
+  const vote = (id: string) => command({ type: 'vote', destinationId: id, round: trip.round, inputRevision: trip.inputRevision });
+  const lock = () => command({ type: 'lock', round: trip.round, inputRevision: trip.inputRevision, idempotencyKey: `lock-${trip.round}` });
+  const sharePlan = () => openWhatsApp(planSummary(trip));
+  const join = () => {
+    const [tripId, ...secret] = token.split('.');
+    request({ action: 'join', tripId, inviteSecret: secret.join('.'), nickname });
+  };
+
+  if (loading)
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-canvas font-sans">
+        <p className="type-body m-0 flex items-center gap-2 text-ink-muted" role="status">
+          <icons.pending className="size-4 animate-pulse" strokeWidth={1.75} aria-hidden />
+          Opening your trip…
+        </p>
+      </main>
+    );
+
+  const step = currentStep(trip, Boolean(me));
+  const joined = trip ? approvedCount(trip) : 0;
+  const requests: any[] = trip?.pendingRequests || [];
+  const showInvite = Boolean(me) && trip?.phase === 'collecting' && (joined < trip.expectedSize || (owner && requests.length > 0));
+  const everyoneIn = trip && joined >= trip.expectedSize && (trip.submissionProgress ?? 0) >= trip.expectedSize;
+  const hasBoard = (trip?.destinationBoard?.length ?? 0) > 0 || (trip?.myPrivateStatus?.length ?? 0) > 0;
+
+  const headerAction =
+    me && trip?.activePlan ? (
+      <Button size="sm" variant="outline" icon={icons.share} onClick={sharePlan}>
+        Share plan
+      </Button>
+    ) : me && invite && trip?.phase === 'collecting' ? (
+      <Button size="sm" variant="whatsapp" icon={icons.whatsapp} onClick={() => openWhatsApp(inviteMessage(trip.name, inviteUrl(invite)))}>
+        Invite
+      </Button>
+    ) : null;
+
+  /* ---------------------------------------------------------------- sections */
+
+  const inviteSection = showInvite && (
+    <Section key="invite" id="step-invite" className="scroll-mt-6" eyebrow={stepEyebrow('invite')} title="Invite your friends" description="Fermat works best when the whole group is in.">
+      <InvitePanel trip={trip} owner={owner} invite={invite} disabled={disabled} command={command} />
+    </Section>
+  );
+
+  const detailsForm = (
+    <PrivateDetailsForm
+      trip={trip}
+      value={privateInput}
+      dirty={privateInputDirty}
+      disabled={disabled}
+      busy={pendingCommand === 'submitConstraints'}
+      onChange={updatePrivateInput}
+      onToggle={togglePrivateList}
+      onSave={saveDetails}
+    />
+  );
+
+  // Before the vote: full form when it's your step, otherwise a private summary with the form tucked away.
+  const detailsSection = me && (trip.phase === 'collecting' || trip.phase === 'voting') && (
+    <Section
+      key="details"
+      id="step-details"
+      className="scroll-mt-6"
+      eyebrow={stepEyebrow('details')}
+      title={step === 'details' || step === 'invite' ? 'What works for you' : 'Your details'}
+      description={trip.phase === 'voting' ? 'Locked while voting is open.' : 'Takes about a minute. You can change it until voting opens.'}
+    >
+      {trip.phase === 'collecting' && (!trip.myConstraints || step === 'details' || step === 'invite') ? (
+        detailsForm
+      ) : (
+        <div className="grid gap-4">
+            <PrivateDetailsSummary trip={trip} value={privateInput} />
+            {trip.phase === 'collecting' && (
+              <details className="group">
+                <summary className="type-small flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-full font-semibold text-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
+                  Change my details
+                  <ChevronDown className="size-4 transition-transform group-open:rotate-180" strokeWidth={2} aria-hidden />
+                </summary>
+                <div className="mt-4">{detailsForm}</div>
+              </details>
+            )}
+        </div>
+      )}
+      <SilentPrefs {...featureProps} />
+    </Section>
+  );
+
+  const voting = trip?.phase === 'voting';
+  const votesIn = trip?.ballotProgress ?? 0;
+  const allVoted = trip && votesIn >= trip.expectedSize;
+  const chooseBar = me && (trip.phase === 'collecting' || voting) && (
+    <Card>
+      <CardBody className="flex flex-col gap-4 pt-5 sm:flex-row sm:items-center sm:justify-between sm:pt-6">
+        {voting ? (
+          <div className="grid min-w-0 flex-1 gap-2">
+            <p className="type-h3 m-0">
+              {votesIn} of {trip.expectedSize} voted
+            </p>
+            <p className="type-small m-0 text-ink-muted">{owner ? (allVoted ? 'Everyone has voted. Lock it in when you are ready.' : 'You can lock now or wait for the rest.') : 'The organizer locks the vote once everyone is in.'}</p>
+            <Progress label="Votes in" value={votesIn} max={trip.expectedSize} />
+          </div>
+        ) : (
+          <div className="min-w-0 flex-1">
+            <p className="type-h3 m-0">
+              {everyoneIn ? "Everyone's details are in" : `Details in: ${trip.submissionProgress ?? 0} of ${trip.expectedSize}`}
+            </p>
+            <p className="type-small m-0 mt-0.5 text-ink-muted">
+              {owner
+                ? everyoneIn
+                  ? 'Open voting when you are ready. Votes stay secret.'
+                  : 'Voting can open once everyone has joined and added details.'
+                : everyoneIn
+                  ? 'Waiting for the organizer to open voting.'
+                  : 'Voting opens once everyone has added details.'}
+            </p>
+          </div>
+        )}
+        {owner && !voting && (
+          <Button
+            size="lg"
+            variant={everyoneIn ? 'primary' : 'outline'}
+            icon={icons.vote}
+            className="w-full sm:w-auto"
+            loading={pendingCommand === 'openVoting'}
+            disabled={disabled}
+            onClick={openVoting}
+          >
+            Open voting
+          </Button>
+        )}
+        {owner && voting && (
+          <Button size="lg" variant={allVoted ? 'primary' : 'outline'} icon={icons.private} className="w-full sm:w-auto" loading={pendingCommand === 'lock'} disabled={disabled} onClick={lock}>
+            Lock and make the plan
+          </Button>
+        )}
+      </CardBody>
+    </Card>
+  );
+
+  const chooseSection = me && (trip.phase === 'collecting' || voting) && (
+    <Section
+      key="choose"
+      id="step-choose"
+      className="scroll-mt-6"
+      eyebrow={stepEyebrow('choose')}
+      title={voting ? 'Vote for where to go' : 'Where you could go'}
+      description={voting ? "Your vote is secret. A place someone can't afford or enter can't win." : 'Everyone sees the same list. Only you see your own fit.'}
+    >
+      {chooseBar}
+      {hasBoard ? (
+        <DestinationPicker trip={trip} disabled={disabled} onVote={vote} />
+      ) : (
+        <EmptyState icon={icons.destination} title="Places show up here soon" description="Once everyone has added their details, you'll see where the whole group can go." />
+      )}
+    </Section>
+  );
+
+  const planSection = me && trip.activePlan && (
+    <Section key="plan" id="step-plan" className="scroll-mt-6" eyebrow={stepEyebrow('plan')} title="Your plan" description="Check the days, then approve it or ask for changes.">
+      <PlanView trip={trip} uid={user!.uid} owner={owner} disabled={disabled} command={command} onShare={sharePlan} />
+      <PlanMoney trip={trip} uid={user!.uid} />
+    </Section>
+  );
+
+  const goSection = me && trip.activePlan && (
+    <Section key="go" id="step-go" className="scroll-mt-6" eyebrow={stepEyebrow('go')} title="Get going" description="Collect the advance, split costs and share the trip.">
+      <UpiPanel trip={trip} uid={user!.uid} owner={owner} disabled={disabled} command={command} />
+      <Pledges {...featureProps} />
+      <SettleUp {...featureProps} />
+      <ShareCards {...featureProps} />
+    </Section>
+  );
+
+  const ordered: Record<StepId, React.ReactNode[]> = {
+    invite: [inviteSection, detailsSection, chooseSection],
+    details: [detailsSection, chooseSection, inviteSection],
+    choose: [chooseSection, detailsSection, inviteSection],
+    plan: [planSection, goSection],
+    go: [goSection, planSection],
+  };
+
+  /* ---------------------------------------------------------------- page */
+
+  return (
+    <main className="bg-canvas pb-6 font-sans text-ink">
+      <PageContainer>
+        <TopBar trip={me ? trip : undefined} action={headerAction} />
+
+        {(!online || error) && (
+          <div className="mt-4 grid gap-3">
+            {!online && (
+              <Notice tone="warning" icon={WifiOff} title="You're offline.">
+                Buttons are paused until you're back. Anything you've typed stays here.
+              </Notice>
+            )}
+            {error && (
+              <Notice
+                tone="danger"
+                role="alert"
+                title="That didn't work."
+                action={
+                  <Button size="sm" variant="ghost" onClick={() => setError('')}>
+                    Dismiss
+                  </Button>
+                }
+              >
+                {error}
+              </Notice>
+            )}
+          </div>
+        )}
+
+        {!trip && (
+          <div className="mx-auto grid max-w-content gap-8 pt-6 sm:pt-10 lg:max-w-none lg:grid-cols-2 lg:items-start lg:gap-16 lg:pt-16">
+            <EntryHero />
+            <div className="grid gap-4">
+              {!sharedFirebaseConfigured && !preview ? (
+                <Notice tone="warning" title="Shared trips aren't set up here.">
+                  This copy of Fermat is missing its Firebase settings (NEXT_PUBLIC_FIREBASE_*), so trips can't be saved. Try the offline demo below instead.
+                </Notice>
+              ) : !user ? (
+                <SignInCard invited={Boolean(token)} consented={consented} onConsent={updateConsent} />
+              ) : token ? (
+                <JoinRoomCard nickname={nickname} onNickname={setNickname} onJoin={join} disabled={busy} busy={pendingCommand === 'join'} />
+              ) : user.isAnonymous ? (
+                <OrganizerIdentityCard />
+              ) : (
+                <CreateRoomCard draft={draft} onChange={setDraft} onCreate={() => request({ action: 'create', idempotencyKey: createKey, trip: draft })} disabled={disabled} busy={pendingCommand === 'create'} />
+              )}
+            </div>
+          </div>
+        )}
+
+        {trip && !me && (
+          <div className="mx-auto grid max-w-content gap-6 pt-8 sm:pt-12">
+            <div className="grid gap-1 text-center">
+              <p className="type-overline m-0 text-brand-600">You asked to join</p>
+              <h1 className="type-h1 m-0">{trip.name}</h1>
+            </div>
+            {trip.membershipStatus === 'pending' ? (
+              <PendingApproval />
+            ) : (
+              <EmptyState icon={icons.private} title="You're not in this trip" description="Ask the organizer for a new invite link." />
+            )}
+          </div>
+        )}
+
+        {trip && me && (
+          <>
+            <TripHeader trip={trip} owner={owner} step={step} onStepClick={scrollToStep} />
+            <div className="mt-10 grid gap-12 lg:grid-cols-12 lg:gap-8">
+              <div className="grid min-w-0 content-start gap-12 sm:gap-16 lg:col-span-8">{ordered[step].filter(Boolean)}</div>
+              <aside className="grid min-w-0 content-start gap-6 lg:col-span-4" aria-label="Trip overview">
+                <TripSummary trip={trip} uid={user.uid} owner={owner && !showInvite} disabled={disabled} command={command} />
+                <Tasks {...featureProps} />
+              </aside>
+            </div>
+          </>
+        )}
+
+        <PlannerFooter />
+      </PageContainer>
+    </main>
+  );
+}
