@@ -84,6 +84,28 @@ npm run test:groq
 The test makes one very small completion request and never prints the API key.
 It is a connectivity check, not an end-to-end destination-generation check.
 
+## Vercel production setup
+
+Shared planning and Groq workflows require these project environment variables
+in Production, Preview and Development:
+
+```text
+FIREBASE_PROJECT_ID
+FIREBASE_SERVICE_ACCOUNT_JSON
+FERMAT_AI_PROVIDER=groq
+GROQ_API_KEY
+GROQ_MODEL=openai/gpt-oss-20b
+```
+
+Store both credential values as Vercel secrets. The Firebase value is the
+complete service-account JSON object, not a path to a downloaded file. Never
+commit either credential or prefix it with `NEXT_PUBLIC_`.
+
+Environment-variable changes only apply to new deployments. After updating
+them, redeploy the current production commit or merge a small reviewed PR into
+the configured production branch so the Git integration creates a fresh build.
+Verify the deployment reaches `Ready` before testing `/plan`.
+
 ## Implementation
 
 - `src/lib/ai/groq.ts` contains the server-only Groq JSON client.
